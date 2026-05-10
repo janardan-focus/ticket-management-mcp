@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # --- MongoDB ---
-    mongodb_uri: str = Field(default='mongodb+srv://REDACTED/?appName=Experimental', description="MongoDB connection URI (same as Next.js MONGODB_URI)")
+    mongodb_uri: str = Field(..., description="MongoDB connection URI (same as Next.js MONGODB_URI)")
     # Mongoose defaults to 'test' when no DB is in the URI path.
     # Override this if your Atlas cluster uses a different database name.
     mongodb_db_name: str = Field(default="test", description="MongoDB database name")
