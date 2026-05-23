@@ -1,298 +1,186 @@
 # Ticket Management MCP Server
 
-A standalone **Python MCP (Model Context Protocol) server** that exposes ticket management tools over a **JSON-RPC 2.0 HTTP endpoint** — replacing the MCP endpoint that was previously embedded inside the Next.js app.
+A standalone **Python MCP (Model Context Protocol) server** that exposes ticket management tools over a **JSON-RPC 2.0 HTTP endpoint**.
 
-The `generative-ui-agents-server` (LangGraph agent backend) calls this server to read and write ticket/project data directly from MongoDB, with no dependency on the Next.js app being alive.
+The `generative-ui-agents-server` (LangGraph agent backend) calls this server, which forwards every tool call to the **Next.js REST API** — making it a thin, authenticated proxy rather than a direct database client.
 
 ---
 
-## Why This Exists
+## Why REST API, not direct MongoDB
 
-The original architecture had the Next.js app (`localhost:3000`) doubling as both a UI server and an MCP data endpoint (`/api/mcp`). This Python server separates those concerns:
+The original design had this server talking directly to MongoDB Atlas, replicating every business rule from the Next.js actions layer (identifier generation, `$lookup` pipelines, API key SHA-256 validation, kanban key format). That meant **every rule lived in two places** — a maintenance hazard and a source of silent drift.
 
-```
-Before:
-  agents-server → POST http://localhost:3000/api/mcp  (Next.js)
+### What changed
 
-After:
-  agents-server → POST http://localhost:8001/mcp       (this server)
-                                    ↓
-                              MongoDB Atlas (direct)
-```
+| Concern | Before (direct Mongo) | After (REST proxy) |
+|---|---|---|
+| Business logic | Duplicated in Python | Lives only in Next.js actions |
+| Auth | SHA-256 hash lookup in Python | `Bearer` token forwarded; Next.js validates |
+| Consistency | Manual sync required | Same route = identical behaviour by construction |
+| Dependency | Standalone (needed Atlas URI) | Requires Next.js app to be running |
 
-Benefits:
-- The MCP data layer runs independently — the Next.js app no longer needs to be up for agent queries to work
-- Python-native stack — easier to extend with new tools using the same language as the agent pipeline
-- Same wire format — the existing `MCPHTTPClient` in `generative-ui-agents-server` works with zero code changes (only the URL in `.env` changes)
+### Why the trade-off is worth it
+
+The MCP server is now a **thin HTTP client** — each tool handler is ~5 lines. Any change to Next.js actions (new fields, new validation, new relations) is automatically reflected in the MCP tools with zero Python changes. The coupling to Next.js uptime is intentional: the Next.js REST API is the single data gateway for all clients.
 
 ---
 
 ## Architecture
 
 ```
+mcp-chat-client (:5173)
+  └─ GET /chat/stream
+       └─ agents-server (:8000)        ← LangGraph agents
+            └─ POST /mcp  Bearer tms_...
+                 └─ THIS server (:8001) ← MCP JSON-RPC proxy
+                      └─ HTTP REST
+                           └─ Next.js (:3000)   ← single data gateway
+                                └─ MongoDB Atlas
+```
+
+```
 ticket-management-mcp/
+├── main.py              # FastAPI app — POST /mcp (JSON-RPC 2.0), format-check auth
+├── config.py            # TMS_API_BASE_URL, MCP_SERVER_PORT, CORS_ORIGINS
+├── requirements.txt     # fastapi, uvicorn, httpx, pydantic, pydantic-settings
+├── .env / .env.example
 │
-├── main.py              # Entry point — FastAPI app with POST /mcp
-├── config.py            # All env vars via pydantic-settings
-├── requirements.txt     # Python dependencies
-├── .env                 # Local secrets (MongoDB URI, port, etc.)
-├── .env.example         # Template — copy this to .env
-│
-├── db/
-│   └── connection.py    # Motor (async MongoDB) client singleton
-│                        # + collection name constants
+├── api/
+│   └── client.py        # TMSApiClient (httpx) + TMSApiError
 │
 ├── auth/
-│   └── api_key.py       # API key validation (SHA-256 hash lookup)
+│   └── api_key.py       # is_valid_token_format() — cheap prefix check only
 │
 └── tools/
-    ├── _utils.py        # Shared helpers (JSON serialiser, MCP envelope, $lookup builders)
-    ├── registry.py      # Tool registry — maps names to handlers for tools/list + tools/call
-    ├── projects.py      # project_* tool handlers
-    ├── tickets.py       # ticket_* tool handlers
-    └── kanban.py        # kanban_* tool handlers
+    ├── context.py       # ToolContext dataclass (holds TMSApiClient per request)
+    ├── _utils.py        # mcp_ok / mcp_error envelope builders
+    ├── registry.py      # ToolRegistry — maps names → handlers
+    ├── projects.py      # project_* handlers → GET/POST /api/project(s)/*
+    ├── tickets.py       # ticket_* handlers  → GET/POST /api/ticket/*
+    └── kanban.py        # kanban_* handlers  → GET/POST /api/kanban/*
 ```
-
----
-
-## How the MCP Protocol Works Here
-
-This server speaks **JSON-RPC 2.0** over HTTP `POST /mcp` — the same protocol the Next.js app used.
-
-### List available tools
-```http
-POST /mcp
-Authorization: Bearer tms_<your-api-key>
-Content-Type: application/json
-
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "tools/list"
-}
-```
-
-Response:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "tools": [
-      { "name": "project_list", "description": "...", "inputSchema": { ... } },
-      ...
-    ]
-  }
-}
-```
-
-### Call a tool
-```http
-POST /mcp
-Authorization: Bearer tms_<your-api-key>
-Content-Type: application/json
-
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "method": "tools/call",
-  "params": {
-    "name": "project_list",
-    "arguments": {}
-  }
-}
-```
-
-Response:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "result": {
-    "content": [{ "type": "text", "text": "[{\"projectId\": \"...\", ...}]" }]
-  }
-}
-```
-
-The `content[].text` field is always a JSON string — the `MCPHTTPClient` in the agents server parses it automatically.
 
 ---
 
 ## Available Tools
 
-| Tool | Description | Required Args |
+| Tool | REST endpoint | Required args |
 |---|---|---|
-| `project_list` | All projects the authenticated user is a member of | _(none)_ |
-| `project_get_by_identifier` | Get a project by its short identifier (e.g. `TIC-1`) | `identifier` |
-| `project_create` | Create a new project | `name` |
-| `project_update` | Update project name or members | `projectId` |
-| `ticket_list` | Paginated tickets for a project | `projectId` |
-| `ticket_create` | Create a new ticket | `projectId`, `name` |
-| `ticket_update` | Update ticket fields (status, priority, assignees, etc.) | `ticketId`, `projectId` |
-| `kanban_get_column_order` | Get saved column order for a kanban board | `projectId`, `groupType` |
-| `kanban_set_column_order` | Save column order for a kanban board | `projectId`, `groupType`, `columns` |
+| `project_list` | `GET /api/projects` | _(none)_ |
+| `project_get_by_identifier` | `GET /api/project/identifier/{id}` | `identifier` |
+| `project_create` | `POST /api/project/create` | `name` |
+| `project_update` | `POST /api/project/update` | `projectId` |
+| `ticket_list` | `GET /api/ticket/list` | `projectId` |
+| `ticket_create` | `POST /api/ticket/create` | `projectId`, `name` |
+| `ticket_update` | `POST /api/ticket/update` | `ticketId`, `projectId` |
+| `kanban_get_column_order` | `GET /api/kanban/column-order` | `projectId`, `groupType` |
+| `kanban_set_column_order` | `POST /api/kanban/column-order` | `projectId`, `groupType`, `columns` |
 
 ---
 
 ## Authentication
 
-API keys are created in the Ticket Management System UI at `/api-keys`. The key is stored as a SHA-256 hash in the MongoDB `apikeys` collection.
+API keys are created in the Next.js UI at `/api-keys`. Pass the key as a Bearer token:
 
-When calling this server, pass the key as a Bearer token:
 ```
 Authorization: Bearer tms_<your-api-key>
 ```
 
-The server validates it by:
-1. Hashing the provided key with SHA-256
-2. Looking it up in the `apikeys` collection by `keyHash`
-3. Checking `isActive == true` and that `expiresAt` (if set) is in the future
-4. Updating `lastUsedAt` on success and returning the associated `userId`
+**Auth flow:**
+1. This server checks the token starts with `tms_` (fast fail for obviously bad keys).
+2. The raw token is forwarded verbatim on every REST call to Next.js.
+3. The Next.js `tokenParser` validates the key (SHA-256 hash lookup, `isActive`, `expiresAt`) and resolves `userId`.
+4. Auth errors from Next.js surface as `mcp_error(...)` back to the agent.
 
-All tool handlers receive the authenticated `userId` so they can scope queries correctly (e.g. `project_list` only returns projects the user is a member of).
-
----
-
-## Database
-
-This server connects directly to the same **MongoDB Atlas** cluster used by the Next.js app. No data is duplicated — it's the same database, same collections.
-
-### Collection names
-
-Mongoose auto-pluralises model names to lowercase — this server uses the same convention:
-
-| Model (Next.js) | Collection |
-|---|---|
-| `AppUser` | `appusers` |
-| `Project` | `projects` |
-| `Ticket` | `tickets` |
-| `Status` | `statuses` |
-| `Priority` | `priorities` |
-| `ApiKey` | `apikeys` |
-| `KanbanColumnOrder` | `kanbancolumnorders` |
-
-### Joins / Population
-
-MongoDB has no native joins. This server uses **aggregation `$lookup` pipelines** to replicate what Mongoose's `.populate()` does in the Next.js app. For example, `ticket_list` joins across `appusers`, `projects`, `statuses`, and `priorities` in a single aggregation.
+No credential is stored or checked in Python beyond the prefix format.
 
 ---
 
-## Setup & Running
+## Wire Format (JSON-RPC 2.0)
 
-### 1. Clone / navigate to directory
+```http
+POST /mcp
+Authorization: Bearer tms_<key>
+Content-Type: application/json
+
+{ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }
+{ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "project_list", "arguments": {} } }
+```
+
+Responses:
+```json
+{ "jsonrpc": "2.0", "id": 1, "result": { "tools": [...] } }
+{ "jsonrpc": "2.0", "id": 2, "result": { "content": [{ "type": "text", "text": "[{...}]" }] } }
+```
+
+`content[].text` is always a JSON string — the `MCPHTTPClient` in the agents server parses it automatically.
+
+---
+
+## Setup
+
+### 1. Prerequisites
+
+The **Next.js Ticket Management System must be running** before this server can serve any tool call. Set `TMS_API_BASE_URL` to its base URL.
+
+### 2. Install
+
 ```bash
 cd generative-ui/ticket-management-mcp
-```
-
-### 2. Create virtual environment
-```bash
 python -m venv .venv
 source .venv/bin/activate      # macOS/Linux
-# .venv\Scripts\activate       # Windows
-```
-
-### 3. Install dependencies
-```bash
-# If you accidentally installed the standalone bson package before, remove it first:
-pip uninstall bson -y 2>/dev/null || true
-
 pip install -r requirements.txt
-# bson is bundled inside pymongo — do NOT pip install bson separately
 ```
 
-### 4. Configure environment
+### 3. Configure
+
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
+`.env`:
 ```env
-# Same connection string as the Next.js app's MONGODB_URI
-MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/?appName=MyApp
-
-# The database name your Mongoose app uses.
-# Check MongoDB Atlas → your cluster → Collections to find the correct name.
-# Mongoose defaults to 'test' when no DB name is in the URI path.
-MONGODB_DB_NAME=test
-
-# Port for this server (8001 keeps it separate from the agents-server on 8000)
+TMS_API_BASE_URL=http://localhost:3000   # Next.js app — must be reachable
 MCP_SERVER_PORT=8001
-
-# Allowed CORS origins (JSON array format)
 CORS_ORIGINS=["http://localhost:5173","http://localhost:3000","http://localhost:8000"]
 ```
 
-### 5. Start the server
+### 4. Run
+
 ```bash
-# Development (auto-reload on file changes)
 python main.py
-
-# Or directly with uvicorn
+# or
 uvicorn main:app --reload --port 8001
-
-# Production
-uvicorn main:app --host 0.0.0.0 --port 8001 --workers 4
 ```
 
-### 6. Verify it's running
+Health check:
 ```bash
 curl http://localhost:8001/health
-# {"status":"ok","service":"ticket-management-mcp","version":"1.0.0",...}
-```
-
----
-
-## Connecting the Agents Server
-
-The `generative-ui-agents-server` already has its `.env` updated to point here:
-
-```env
-# generative-ui-agents-server/.env
-MCP_SERVER_URL=http://localhost:8001/mcp   # ← was http://localhost:3000/api/mcp
-```
-
-No code changes are needed in the agents server — only this URL change.
-
----
-
-## Full System Flow
-
-```
-Browser
-  └─ mcp-chat-client (Vite :5173)
-       └─ GET /chat/stream?query=...&api_key=...
-            └─ generative-ui-agents-server (:8000)   ← LangGraph agents
-                 └─ POST /mcp  Authorization: Bearer tms_...
-                      └─ THIS server (:8001)           ← you are here
-                           └─ MongoDB Atlas            ← shared DB
-                                ↑
-                 Ticket Management System (:3000)      ← UI only, no longer in data path
+# {"status":"ok","service":"ticket-management-mcp","version":"2.0.0",...}
 ```
 
 ---
 
 ## Adding a New Tool
 
-1. Write your handler in the appropriate file (`tools/projects.py`, `tools/tickets.py`, etc.) following the existing pattern:
+1. Add a handler in the relevant `tools/*.py` file:
    ```python
-   async def my_tool(args: dict, user_id: str) -> dict:
-       # ... Motor queries ...
-       return mcp_ok(result)   # or mcp_error("message")
+   async def my_tool(args: dict, ctx: ToolContext) -> dict:
+       try:
+           data = await ctx.api.get("/api/my-endpoint", params={"id": args["id"]})
+           return mcp_ok(data)
+       except TMSApiError as exc:
+           return mcp_error(f"Error: {exc}")
    ```
 
-2. Define a JSON Schema for the tool inputs (used in `tools/list` responses).
+2. Define its JSON Schema (used in `tools/list`).
 
-3. Register it in `tools/registry.py` by adding a `_ToolEntry` to the `_TOOLS` list:
+3. Register in `tools/registry.py`:
    ```python
-   _ToolEntry(
-       name="my_tool",
-       description="What this tool does",
-       input_schema=MY_TOOL_SCHEMA,
-       handler=my_tool,
-   )
+   _ToolEntry(name="my_tool", description="...", input_schema=MY_SCHEMA, handler=my_tool)
    ```
 
-That's it — it becomes immediately available to the agents server on next request.
+The new tool is immediately available to the agents server — no other changes needed.
 
 ---
 
@@ -300,50 +188,9 @@ That's it — it becomes immediately available to the agents server on next requ
 
 | Package | Purpose |
 |---|---|
-| `fastapi` | HTTP framework and request routing |
+| `fastapi` | HTTP framework and routing |
 | `uvicorn` | ASGI server |
-| `motor==3.3.2` | Async MongoDB driver (built on pymongo) |
-| `pymongo==4.6.3` | MongoDB wire protocol + **bson bundled inside** |
+| `httpx` | Async HTTP client (calls Next.js REST API) |
 | `pydantic` | Data validation |
-| `pydantic-settings` | Environment variable loading |
+| `pydantic-settings` | `.env` loading |
 | `python-dotenv` | `.env` file support |
-
-> **⚠️ Do NOT `pip install bson`**
-> The standalone `bson` package on PyPI is an abandoned, incompatible project. `ObjectId` and all other BSON types ship **inside `pymongo`** — once you install `pymongo`, `from bson import ObjectId` works automatically. Installing the standalone `bson` package will break pymongo's bson import entirely.
-
----
-
-## Troubleshooting
-
-### `Failed to build installable wheels for bson`
-You ran `pip install bson` by mistake. That standalone package is broken and not needed.
-
-Fix:
-```bash
-pip uninstall bson           # remove the broken standalone package
-pip install -r requirements.txt   # pymongo already bundles bson
-```
-
-### `ModuleNotFoundError: No module named 'bson'`
-You have `bson` installed as the standalone package which shadows pymongo's bson.
-
-Fix:
-```bash
-pip uninstall bson pymongo motor
-pip install -r requirements.txt   # fresh install of pymongo (includes bson)
-```
-
-### `AttributeError: module 'lib' has no attribute 'X509_V_FLAG_NOTIFY_POLICY'`
-Your system has an old `pyOpenSSL` (< 23.2.0) conflicting with a newer `cryptography` library.
-
-Fix:
-```bash
-pip install "pyOpenSSL>=23.2.0"
-```
-
-### Motor / pymongo version conflicts
-Pin to the tested versions in `requirements.txt`:
-```
-motor==3.3.2
-pymongo==4.6.3
-```
