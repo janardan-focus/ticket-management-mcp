@@ -4,6 +4,8 @@ Tool registry — maps tool names to handlers + JSON Schemas for tools/list.
 Adding a new tool:
   1. Write the handler in the relevant module (projects.py, tickets.py, etc.)
   2. Add an entry to _TOOLS below.
+
+Handler signature: async def my_tool(args: dict, ctx: ToolContext) -> dict
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Coroutine
 
+from tools.context import ToolContext  # noqa: F401 — re-exported for callers
 from tools.kanban import (
     KANBAN_GET_COLUMN_ORDER_SCHEMA,
     KANBAN_SET_COLUMN_ORDER_SCHEMA,
@@ -38,8 +41,9 @@ from tools.tickets import (
 
 logger = logging.getLogger(__name__)
 
+
 # Type alias for async tool handlers
-ToolHandler = Callable[[dict, str], Coroutine[Any, Any, dict]]
+ToolHandler = Callable[[dict, ToolContext], Coroutine[Any, Any, dict]]
 
 
 class _ToolEntry:
@@ -137,10 +141,10 @@ class ToolRegistry:
             ]
         }
 
-    async def call_tool(self, name: str, args: dict, user_id: str) -> dict:
+    async def call_tool(self, name: str, args: dict, ctx: ToolContext) -> dict:
         """Dispatch a tool call. Raises ValueError for unknown tools."""
         entry = _TOOL_MAP.get(name)
         if not entry:
             raise ValueError(f"Unknown tool: {name}")
-        logger.info("Calling tool '%s' for user '%s'", name, user_id)
-        return await entry.handler(args, user_id)
+        logger.info("Calling tool '%s'", name)
+        return await entry.handler(args, ctx)

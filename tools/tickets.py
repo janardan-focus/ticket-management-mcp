@@ -1,31 +1,20 @@
 """
-Ticket MCP tools — direct MongoDB access via Motor.
+Ticket MCP tools — calls the Next.js REST API.
 
 Tools:
-  ticket_list    → paginated tickets for a project
-  ticket_create  → create a new ticket in a project
-  ticket_update  → update fields on an existing ticket
+  ticket_list    → GET  /api/ticket/list?projectId=&page=&pageSize=&sortBy=&sortOrder=
+  ticket_create  → POST /api/ticket/create
+  ticket_update  → POST /api/ticket/update
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
-from pymongo import ReturnDocument
-
-from db.mongo_types import ObjectId, is_valid_object_id
-
-from db.connection import (
-    COLL_PRIORITIES,
-    COLL_PROJECTS,
-    COLL_STATUSES,
-    COLL_TICKETS,
-    COLL_USERS,
-    get_db,
-)
-from tools._utils import generate_ticket_identifier, mcp_error, mcp_ok
+from api.client import TMSApiError
+from tools._utils import mcp_error, mcp_ok
+from tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -79,155 +68,37 @@ TICKET_UPDATE_SCHEMA: dict[str, Any] = {
 
 
 # ---------------------------------------------------------------------------
-# Aggregation pipeline: populate all refs (mirrors getPaginatedProjectTickets)
-# ---------------------------------------------------------------------------
-
-def _ticket_pipeline(match_stage: dict) -> list[dict]:
-    _user_proj = {
-        "fullname": 1, "firstname": 1, "lastname": 1,
-        "userId": 1, "image": 1, "email": 1, "_id": 0,
-    }
-    _project_proj = {"projectId": 1, "name": 1, "identifier": 1, "_id": 0}
-    _status_proj = {"statusId": 1, "name": 1, "isDefault": 1, "icon": 1, "color": 1, "isDone": 1, "_id": 0}
-    _priority_proj = {"priorityId": 1, "name": 1, "isDefault": 1, "icon": 1, "color": 1, "_id": 0}
-
-    return [
-        {"$match": match_stage},
-        # assigneeIds → array of user objects
-        {
-            "$lookup": {
-                "from": COLL_USERS,
-                "localField": "assigneeIds",
-                "foreignField": "_id",
-                "as": "assigneeIds",
-                "pipeline": [{"$project": _user_proj}],
-            }
-        },
-        # projectId → project object
-        {
-            "$lookup": {
-                "from": COLL_PROJECTS,
-                "localField": "projectId",
-                "foreignField": "_id",
-                "as": "projectId",
-                "pipeline": [{"$project": _project_proj}],
-            }
-        },
-        {"$unwind": {"path": "$projectId", "preserveNullAndEmptyArrays": True}},
-        # statusId → status object
-        {
-            "$lookup": {
-                "from": COLL_STATUSES,
-                "localField": "statusId",
-                "foreignField": "_id",
-                "as": "statusId",
-                "pipeline": [{"$project": _status_proj}],
-            }
-        },
-        {"$unwind": {"path": "$statusId", "preserveNullAndEmptyArrays": True}},
-        # priorityId → priority object
-        {
-            "$lookup": {
-                "from": COLL_PRIORITIES,
-                "localField": "priorityId",
-                "foreignField": "_id",
-                "as": "priorityId",
-                "pipeline": [{"$project": _priority_proj}],
-            }
-        },
-        {"$unwind": {"path": "$priorityId", "preserveNullAndEmptyArrays": True}},
-        # createdById → user object
-        {
-            "$lookup": {
-                "from": COLL_USERS,
-                "localField": "createdById",
-                "foreignField": "_id",
-                "as": "createdById",
-                "pipeline": [{"$project": _user_proj}],
-            }
-        },
-        {"$unwind": {"path": "$createdById", "preserveNullAndEmptyArrays": True}},
-        # updatedById → user object
-        {
-            "$lookup": {
-                "from": COLL_USERS,
-                "localField": "updatedById",
-                "foreignField": "_id",
-                "as": "updatedById",
-                "pipeline": [{"$project": _user_proj}],
-            }
-        },
-        {"$unwind": {"path": "$updatedById", "preserveNullAndEmptyArrays": True}},
-    ]
-
-
-def _doc_to_detail(doc: dict) -> dict:
-    """Mirror castTicketDocumentToDetails from utils.ts."""
-    return {
-        "ticketId": str(doc.get("ticketId") or doc.get("_id", "")),
-        "name": doc.get("name", ""),
-        "description": doc.get("description", ""),
-        "identifier": doc.get("identifier", ""),
-        "createdAt": doc["createdAt"].isoformat() if doc.get("createdAt") else None,
-        "updatedAt": doc["updatedAt"].isoformat() if doc.get("updatedAt") else None,
-        "assignee": doc.get("assigneeIds", []),
-        "status": doc.get("statusId"),
-        "priority": doc.get("priorityId"),
-        "project": doc.get("projectId"),
-        "createdBy": doc.get("createdById"),
-        "updatedBy": doc.get("updatedById"),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Tool handlers
 # ---------------------------------------------------------------------------
 
-async def ticket_list(args: dict, user_id: str) -> dict:
-    """Return paginated tickets for a project (default page=1, pageSize=100, sortBy=createdAt desc)."""
+async def ticket_list(args: dict, ctx: ToolContext) -> dict:
+    """Return paginated tickets for a project."""
     project_id: str | None = args.get("projectId")
     if not project_id:
         return mcp_error("Error listing tickets: projectId is required")
 
-    page = max(1, int(args.get("page", 1)))
-    page_size = max(1, min(200, int(args.get("pageSize", 100))))
-    sort_by = args.get("sortBy", "createdAt")
-    sort_order = -1 if args.get("sortOrder", "desc") == "desc" else 1
-    skip = (page - 1) * page_size
+    params: dict[str, Any] = {"projectId": project_id}
+    if "page" in args:
+        params["page"] = int(args["page"])
+    if "pageSize" in args:
+        params["pageSize"] = int(args["pageSize"])
+    if "sortBy" in args:
+        params["sortBy"] = args["sortBy"]
+    if "sortOrder" in args:
+        params["sortOrder"] = args["sortOrder"]
 
     try:
-        db = get_db()
-        coll = db[COLL_TICKETS]
-
-        match = {"projectId": ObjectId(project_id)}
-
-        # Total count
-        total_records = await coll.count_documents(match)
-
-        # Paginated pipeline
-        pipeline = _ticket_pipeline(match) + [
-            {"$sort": {sort_by: sort_order}},
-            {"$skip": skip},
-            {"$limit": page_size},
-        ]
-        cursor = await coll.aggregate(pipeline)
-        tickets = [_doc_to_detail(doc) async for doc in cursor]
-
-        return mcp_ok({
-            "data": tickets,
-            "totalRecords": total_records,
-            "totalPages": -(-total_records // page_size),  # ceiling division
-            "page": page,
-            "pageSize": page_size,
-            "sortBy": sort_by,
-            "sortOrder": "desc" if sort_order == -1 else "asc",
-        })
+        data = await ctx.api.get("/api/ticket/list", params=params)
+        return mcp_ok(data)
+    except TMSApiError as exc:
+        logger.error("ticket_list failed: %s", exc)
+        return mcp_error(f"Error listing tickets: {exc}")
     except Exception as exc:
-        logger.exception("ticket_list failed")
+        logger.exception("ticket_list unexpected error")
         return mcp_error(f"Error listing tickets: {exc}")
 
 
-async def ticket_create(args: dict, user_id: str) -> dict:
+async def ticket_create(args: dict, ctx: ToolContext) -> dict:
     """Create a new ticket in the specified project."""
     project_id: str | None = args.get("projectId")
     name: str | None = args.get("name")
@@ -237,73 +108,31 @@ async def ticket_create(args: dict, user_id: str) -> dict:
     if not name or not name.strip():
         return mcp_error("Error creating ticket: name is required")
 
+    body: dict[str, Any] = {
+        "projectId": project_id,
+        "name": name.strip(),
+    }
+    if args.get("description") is not None:
+        body["description"] = args["description"]
+    if args.get("assigneeIds"):
+        body["assigneeIds"] = args["assigneeIds"]
+    if args.get("statusId"):
+        body["statusId"] = args["statusId"]
+    if args.get("priorityId"):
+        body["priorityId"] = args["priorityId"]
+
     try:
-        db = get_db()
-        ticket_coll = db[COLL_TICKETS]
-        project_coll = db[COLL_PROJECTS]
-
-        # Fetch project for identifier generation
-        project_doc = await project_coll.find_one({"projectId": project_id})
-        if not project_doc:
-            return mcp_error(f"Error creating ticket: project '{project_id}' not found")
-
-        project_identifier: str = project_doc.get("identifier", "TICK")
-        ticket_identifier = await generate_ticket_identifier(
-            project_identifier, project_id, ticket_coll
-        )
-
-        # Build assigneeIds
-        assignee_oids: list[ObjectId] = []
-        for aid in (args.get("assigneeIds") or []):
-            try:
-                assignee_oids.append(ObjectId(aid))
-            except Exception:
-                pass
-
-        new_id = ObjectId()
-        now = datetime.now(tz=timezone.utc)
-
-        doc: dict[str, Any] = {
-            "_id": new_id,
-            "ticketId": str(new_id),
-            "name": name.strip(),
-            "description": args.get("description", ""),
-            "identifier": ticket_identifier,
-            "assigneeIds": assignee_oids,
-            "projectId": ObjectId(project_id),
-            "createdById": ObjectId(user_id),
-            "updatedById": ObjectId(user_id),
-            "createdAt": now,
-            "updatedAt": now,
-        }
-
-        # Optional references
-        if args.get("statusId"):
-            try:
-                doc["statusId"] = ObjectId(args["statusId"])
-            except Exception:
-                pass
-        if args.get("priorityId"):
-            try:
-                doc["priorityId"] = ObjectId(args["priorityId"])
-            except Exception:
-                pass
-
-        await ticket_coll.insert_one(doc)
-
-        # Fetch back with populated fields
-        pipeline = _ticket_pipeline({"_id": new_id})
-        cursor = ticket_coll.aggregate(pipeline)
-        docs = [d async for d in cursor]
-        created = _doc_to_detail(docs[0]) if docs else {"ticketId": str(new_id)}
-
-        return mcp_ok(created)
+        data = await ctx.api.post("/api/ticket/create", json=body)
+        return mcp_ok(data)
+    except TMSApiError as exc:
+        logger.error("ticket_create failed: %s", exc)
+        return mcp_error(f"Error creating ticket: {exc}")
     except Exception as exc:
-        logger.exception("ticket_create failed")
+        logger.exception("ticket_create unexpected error")
         return mcp_error(f"Error creating ticket: {exc}")
 
 
-async def ticket_update(args: dict, user_id: str) -> dict:
+async def ticket_update(args: dict, ctx: ToolContext) -> dict:
     """Update fields on an existing ticket."""
     ticket_id: str | None = args.get("ticketId")
     project_id: str | None = args.get("projectId")
@@ -313,53 +142,44 @@ async def ticket_update(args: dict, user_id: str) -> dict:
     if not project_id:
         return mcp_error("Error updating ticket: projectId is required")
 
-    update_fields: dict[str, Any] = {}
+    body: dict[str, Any] = {
+        "ticketId": ticket_id,
+        "projectId": project_id,
+    }
+    has_updates = False
 
     if "name" in args and args["name"]:
-        update_fields["name"] = args["name"].strip()
+        body["name"] = args["name"].strip()
+        has_updates = True
     if "description" in args:
-        update_fields["description"] = args["description"]
+        body["description"] = args["description"]
+        has_updates = True
     if "assigneeIds" in args and isinstance(args["assigneeIds"], list):
-        update_fields["assigneeIds"] = [
-            ObjectId(aid) for aid in args["assigneeIds"]
-            if is_valid_object_id(aid)
-        ]
-    if "statusId" in args and args["statusId"] and is_valid_object_id(args["statusId"]):
-        update_fields["statusId"] = ObjectId(args["statusId"])
-    if "priorityId" in args and args["priorityId"] and is_valid_object_id(args["priorityId"]):
-        update_fields["priorityId"] = ObjectId(args["priorityId"])
+        body["assigneeIds"] = args["assigneeIds"]
+        has_updates = True
+    if "statusId" in args and args["statusId"]:
+        body["statusId"] = args["statusId"]
+        has_updates = True
+    if "priorityId" in args and args["priorityId"]:
+        body["priorityId"] = args["priorityId"]
+        has_updates = True
 
-    if not update_fields:
+    if not has_updates:
         return mcp_error(
             "Error updating ticket: no fields to update "
             "(provide name, description, assigneeIds, statusId, or priorityId)"
         )
 
     try:
-        update_fields["updatedById"] = ObjectId(user_id)
-        update_fields["updatedAt"] = datetime.now(tz=timezone.utc)
-
-        db = get_db()
-        coll = db[COLL_TICKETS]
-
-        result = await coll.find_one_and_update(
-            {"ticketId": ticket_id, "projectId": ObjectId(project_id)},
-            {"$set": update_fields},
-            return_document=ReturnDocument.AFTER,
-        )
-
-        if not result:
+        data = await ctx.api.post("/api/ticket/update", json=body)
+        return mcp_ok(data)
+    except TMSApiError as exc:
+        logger.error("ticket_update failed: %s", exc)
+        if exc.status_code == 404:
             return mcp_error(
                 f"Error updating ticket: ticket '{ticket_id}' not found in project '{project_id}'"
             )
-
-        # Fetch back with populated fields
-        pipeline = _ticket_pipeline({"ticketId": ticket_id})
-        cursor = await coll.aggregate(pipeline)
-        docs = [d async for d in cursor]
-        updated = _doc_to_detail(docs[0]) if docs else result
-
-        return mcp_ok(updated)
+        return mcp_error(f"Error updating ticket: {exc}")
     except Exception as exc:
-        logger.exception("ticket_update failed")
+        logger.exception("ticket_update unexpected error")
         return mcp_error(f"Error updating ticket: {exc}")

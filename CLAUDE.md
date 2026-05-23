@@ -1,15 +1,41 @@
 # CLAUDE.md — ticket-management-mcp
 
+## Design decision: why REST API, not direct MongoDB
+
+The MCP server was originally a Python clone of the Next.js business logic — it
+ran the same `$lookup` aggregations, generated identifiers, and validated API keys
+against MongoDB itself. That meant **every business rule existed twice** and any
+change to the Next.js actions had to be manually mirrored here.
+
+The server was refactored to call the Next.js REST API instead:
+
+- **Single source of truth.** Identifier generation, kanban key format, populate
+  shape, member rules — all live only in the Next.js actions layer. The MCP tools
+  become thin HTTP callers (~5 lines each).
+- **Consistent behaviour by construction.** The MCP server hits the exact same
+  `/api/*` routes the web UI uses, so validation, audit fields, and error handling
+  are identical without any extra effort.
+- **Pass-through auth.** The caller's `Bearer tms_<key>` is forwarded verbatim to
+  every Next.js route. The API resolves `userId` and enforces permissions — no
+  duplicate SHA-256 hash lookup in Python.
+
+Trade-off accepted: the MCP server now depends on the Next.js app being up. This
+is intentional — the Next.js REST API is the single data gateway.
+
 ## Project Overview
 
 **Python FastAPI** server that exposes all Ticket Management System tools over the
 **MCP JSON-RPC 2.0 wire protocol** — a drop-in replacement for the Next.js `/api/mcp` endpoint.
 
-Key design goals:
+Key design goals (post-migration):
 - Identical wire format to the Next.js endpoint → `MCPHTTPClient` in `generative-ui-agents-server` works with **zero changes**
-- **Direct MongoDB access** via Motor (async) — no dependency on the Next.js app being alive
-- Same authentication logic (SHA-256 API key hash, checked against the shared `ApiKey` collection)
-- Same business rules (project/ticket identifier generation, kanban key format)
+- **REST API client** (`api/client.py`, httpx) — no direct MongoDB access
+- **Pass-through auth** — the caller's `Bearer tms_<key>` is forwarded verbatim to every Next.js route; the API enforces user identity and permissions
+- Business logic (identifier generation, populate/$lookup, kanban key format) lives **only** in the Next.js actions layer
+
+> **Coupling note:** The MCP server hard-depends on the Next.js app being up.
+> `TMS_API_BASE_URL` must point to a reachable instance. Previously it could run
+> standalone against Atlas — that is no longer the case by design.
 
 ---
 
@@ -18,13 +44,9 @@ Key design goals:
 | Layer | Tech |
 |---|---|
 | Web framework | FastAPI 0.115+, uvicorn |
-| Database | pymongo 4.16+ — native `AsyncMongoClient` (Motor removed) |
+| HTTP client | httpx 0.27+ (async, reused per request) |
 | Config | pydantic-settings 2.x |
 | Python | 3.13, virtual env at `.venv/` |
-
-> **Motor removed (May 2025):** pymongo 4.9+ ships `AsyncMongoClient` natively.
-> Motor is no longer a dependency. The `[srv]` extra (`pymongo[srv]`) pulls in
-> `dnspython` for `mongodb+srv://` Atlas connection strings.
 
 ---
 
@@ -33,23 +55,27 @@ Key design goals:
 ```
 ticket-management-mcp/
 ├── main.py              # FastAPI app — POST /mcp endpoint (JSON-RPC 2.0)
-├── config.py            # Pydantic settings (reads .env)
-├── requirements.txt
+├── config.py            # Pydantic settings (reads .env) — TMS_API_BASE_URL, MCP_SERVER_PORT
+├── requirements.txt     # fastapi, uvicorn, httpx, pydantic, pydantic-settings
 ├── .env                 # Local env vars (git-ignored in prod)
 ├── .env.example         # Template
 │
-├── db/
+├── api/
 │   ├── __init__.py
-│   └── connection.py    # Motor client singleton + collection name constants
+│   └── client.py        # TMSApiClient — async httpx wrapper + TMSApiError
 │
 ├── auth/
 │   ├── __init__.py
-│   └── api_key.py       # API key validation (SHA-256 hash, port of Next.js validateApiKey)
+│   └── api_key.py       # Stub: is_valid_token_format() format check only (DB lookup removed)
+│
+├── db/                  # DEPRECATED — tombstone stubs, safe to delete from repo
+│   ├── connection.py    # raises ImportError
+│   └── mongo_types.py   # raises ImportError
 │
 └── tools/
     ├── __init__.py
-    ├── _utils.py        # Shared: JSON serialisation, MCP envelope builder, $lookup helpers
-    ├── registry.py      # ToolRegistry: tools/list + tools/call dispatcher
+    ├── _utils.py        # mcp_ok, mcp_error (Mongo helpers removed)
+    ├── registry.py      # ToolRegistry + ToolContext dataclass
     ├── projects.py      # project_list, project_get_by_identifier, project_create, project_update
     ├── tickets.py       # ticket_list, ticket_create, ticket_update
     └── kanban.py        # kanban_get_column_order, kanban_set_column_order
@@ -60,43 +86,47 @@ ticket-management-mcp/
 ## Environment Variables (`.env`)
 
 ```
-MONGODB_URI=mongodb+srv://...    # Same as Next.js MONGODB_URI
-MONGODB_DB_NAME=test             # DB name (Mongoose defaults to 'test' when not in URI path)
-MCP_SERVER_PORT=8001             # Port to listen on (8000 = agents-server)
-CORS_ORIGINS=http://...          # Comma-separated allowed origins
+TMS_API_BASE_URL=http://localhost:3000   # Next.js app base URL — must be reachable
+MCP_SERVER_PORT=8001                     # Port to listen on (8000 = agents-server)
+CORS_ORIGINS=["http://localhost:5173","http://localhost:3000","http://localhost:8000"]
 ```
 
 ---
 
 ## MCP Tools Exposed
 
-| Tool | Description |
+| Tool | REST endpoint |
 |---|---|
-| `project_list` | All projects the user is a member of |
-| `project_get_by_identifier` | Single project by short identifier (e.g. `TIC-1`) |
-| `project_create` | Create a new project |
-| `project_update` | Update project name / members |
-| `ticket_list` | Paginated tickets for a project |
-| `ticket_create` | Create a ticket (auto-generates identifier) |
-| `ticket_update` | Update ticket fields |
-| `kanban_get_column_order` | Retrieve board column order |
-| `kanban_set_column_order` | Persist board column order |
+| `project_list` | `GET /api/projects` |
+| `project_get_by_identifier` | `GET /api/project/identifier/{identifier}` |
+| `project_create` | `POST /api/project/create` |
+| `project_update` | `POST /api/project/update` |
+| `ticket_list` | `GET /api/ticket/list?projectId=&page=&pageSize=&sortBy=&sortOrder=` |
+| `ticket_create` | `POST /api/ticket/create` |
+| `ticket_update` | `POST /api/ticket/update` |
+| `kanban_get_column_order` | `GET /api/kanban/column-order?projectId=&groupType=` |
+| `kanban_set_column_order` | `POST /api/kanban/column-order` |
 
 ---
 
-## MongoDB Collection Names
+## Auth Flow
 
-Mongoose auto-pluralises model names (lowercase):
+```
+agents-server
+  └─ POST /mcp
+      Authorization: Bearer tms_<key>
+          │
+          ▼
+    main.py: cheap format check (startswith "tms_")
+          │
+          ▼
+    api/client.py: forward header verbatim on every REST call
+          │
+          ▼
+    Next.js tokenParser → validateApiKey (SHA-256 lookup) → resolves userId
+```
 
-| Mongoose Model | Collection |
-|---|---|
-| `AppUser` | `appusers` |
-| `Project` | `projects` |
-| `Ticket` | `tickets` |
-| `Status` | `statuses` |
-| `Priority` | `priorities` |
-| `ApiKey` | `apikeys` |
-| `KanbanColumnOrder` | `kanbancolumnorders` |
+The MCP server never reads the database itself — it is a thin HTTP proxy.
 
 ---
 
@@ -120,25 +150,15 @@ Responses (identical to Next.js endpoint):
 
 ---
 
-## Business Rules Replicated from Next.js
+## Inter-Service Communication
 
-### API Key Validation (`auth/api_key.py`)
-- `tms_` prefix → SHA-256 hash → lookup by `keyHash` in `apikeys` collection
-- 24-char hex → legacy `keyId` lookup (deprecated, warns)
-- Checks `isActive == True` and `expiresAt` not in the past
-- Updates `lastUsedAt` on success
-
-### Project Identifier Generation (`tools/_utils.py`)
-- Format: `{name[:3]}-{counter}` (counter 1–100), then `{random3}-{counter}`
-- Stored in UPPER CASE
-- Loops until unique (case-insensitive check)
-
-### Ticket Identifier Generation (`tools/_utils.py`)
-- Format: `{project.identifier}-{ticket_count+1}` (UPPER CASE)
-- Loops until unique
-
-### Kanban Column Order Key (`tools/kanban.py`)
-- Format: `{userId}_{projectId}_{groupType}` (mirrors `getKanbanColumnOrderKey` in utils.ts)
+```
+mcp-chat-client (Vite :5173)
+    └─ GET /chat/stream ──► generative-ui-agents-server (:8000)
+                                └─ POST /mcp ──► THIS server (:8001)
+                                                    └─ HTTP ──► Next.js (:3000)
+                                                                    └─ Mongoose ──► MongoDB Atlas
+```
 
 ---
 
@@ -154,7 +174,10 @@ pip install -r requirements.txt
 
 # Copy and configure env
 cp .env.example .env
-# Edit .env — set MONGODB_URI and MONGODB_DB_NAME
+# Edit .env — set TMS_API_BASE_URL to your Next.js app URL
+
+# Ensure Next.js app is running (it is required)
+# cd ../Ticket-Management-System && npm run dev
 
 # Start (reload mode for development)
 python main.py
@@ -164,24 +187,10 @@ uvicorn main:app --reload --port 8001
 
 ---
 
-## Inter-Service Communication
-
-```
-mcp-chat-client (Vite :5173)
-    └─ GET /chat/stream ──► generative-ui-agents-server (:8000)
-                                └─ POST /mcp ──► THIS server (:8001)
-                                                    └─ Motor ──► MongoDB Atlas
-```
-
-The agents-server's `MCP_SERVER_URL` is set to `http://localhost:8001/mcp` in its `.env`.
-The Next.js app (`:3000`) is still needed for the **UI** — only the MCP data path is replaced.
-
----
-
 ## Key Files to Know First
 
-1. `main.py` — FastAPI app, auth flow, JSON-RPC dispatch
-2. `tools/registry.py` — tool list and name→handler mapping
-3. `auth/api_key.py` — SHA-256 key validation
-4. `db/connection.py` — Motor client + collection name constants
-5. `tools/_utils.py` — MCP envelope builder, $lookup helpers, identifier generators
+1. `main.py` — FastAPI app, format-check auth, JSON-RPC dispatch, per-request `ToolContext`
+2. `api/client.py` — `TMSApiClient` (httpx wrapper) + `TMSApiError`
+3. `tools/registry.py` — `ToolRegistry`, `ToolContext` dataclass, handler dispatch
+4. `tools/_utils.py` — `mcp_ok`, `mcp_error` envelope builders
+5. `config.py` — `TMS_API_BASE_URL` and other settings
