@@ -2,14 +2,17 @@
 Ticket Management MCP Server
 =============================
 Python FastAPI server that exposes all ticket-management tools over the
-MCP JSON-RPC 2.0 wire protocol — a drop-in replacement for the Next.js
-/api/mcp endpoint.
+MCP JSON-RPC 2.0 wire protocol.
+
+Auth: forward the caller's Bearer token verbatim to the Next.js REST API.
+      A cheap format check (must start with "tms_") is applied locally so
+      obviously-bad keys fail fast without a round-trip.
 
 Wire format is identical to the Next.js MCP endpoint so the existing
 MCPHTTPClient in generative-ui-agents-server works without any changes.
 
 Endpoint:  POST /mcp
-Auth:      Authorization: Bearer <tms_...api_key>
+Auth:      Authorization: Bearer tms_<api_key>
 """
 
 from __future__ import annotations
@@ -23,9 +26,9 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from auth.api_key import validate_api_key
+from api.client import TMSApiClient
 from config import settings
-from db.connection import connect_db, disconnect_db
+from tools.context import ToolContext
 from tools.registry import ToolRegistry
 
 logging.basicConfig(
@@ -36,17 +39,6 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Lifespan: open / close MongoDB connection
-# ---------------------------------------------------------------------------
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await connect_db()
-    yield
-    await disconnect_db()
-
-
-# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -54,10 +46,9 @@ app = FastAPI(
     title="Ticket Management MCP Server",
     description=(
         "Python MCP server exposing ticket-management tools over JSON-RPC 2.0. "
-        "Direct MongoDB access — replaces the Next.js /api/mcp endpoint."
+        "Calls the Next.js REST API — no direct MongoDB access."
     ),
-    version="1.0.0",
-    lifespan=lifespan,
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -83,6 +74,14 @@ def _ok(rpc_id: Any, result: Any) -> dict:
     return {"jsonrpc": "2.0", "id": rpc_id, "result": result}
 
 
+def _is_valid_token_format(token: str) -> bool:
+    """
+    Cheap local format check — avoids a round-trip for obviously bad keys.
+    Real validation happens inside the Next.js API on every call.
+    """
+    return token.startswith("tms_") or (len(token) == 24 and token.isalnum())
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -93,10 +92,11 @@ async def health() -> dict:
     return {
         "status": "ok",
         "service": "ticket-management-mcp",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "protocol": "mcp",
         "transport": "http",
         "endpoint": "/mcp",
+        "backend": settings.tms_api_base_url,
     }
 
 
@@ -109,7 +109,7 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
       tools/list  — return all available tool definitions
       tools/call  — execute a named tool
     """
-    # ---- 1. Authentication -----------------------------------------------
+    # ---- 1. Authentication (format check only) ---------------------------
     auth_header = request.headers.get("authorization", "")
     if not auth_header.startswith("Bearer "):
         return JSONResponse(
@@ -117,15 +117,13 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
             status_code=401,
         )
 
-    api_key = auth_header[7:]  # strip "Bearer "
-    validation = await validate_api_key(api_key)
-    if not validation["valid"]:
+    bearer_token = auth_header[7:]  # strip "Bearer "
+
+    if not _is_valid_token_format(bearer_token):
         return JSONResponse(
-            _err(None, -32001, validation.get("error") or "Invalid API key"),
+            _err(None, -32001, 'Unauthorized: API key must start with "tms_"'),
             status_code=401,
         )
-
-    user_id: str = validation["user_id"]  # type: ignore[assignment]
 
     # ---- 2. Parse JSON-RPC body ------------------------------------------
     try:
@@ -146,7 +144,15 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    # ---- 3. Dispatch -------------------------------------------------------
+    # ---- 3. Build context (REST client scoped to this request's token) ----
+    ctx = ToolContext(
+        api=TMSApiClient(
+            base_url=settings.tms_api_base_url,
+            bearer_token=bearer_token,
+        )
+    )
+
+    # ---- 4. Dispatch -------------------------------------------------------
     try:
         if method == "tools/list":
             result = registry.list_tools()
@@ -161,7 +167,7 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
                     status_code=400,
                 )
 
-            result = await registry.call_tool(tool_name, tool_args, user_id)
+            result = await registry.call_tool(tool_name, tool_args, ctx)
 
         else:
             return JSONResponse(
@@ -179,6 +185,10 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
             _err(rpc_id, -32603, f"Internal error: {exc}"),
             status_code=500,
         )
+
+    finally:
+        # Close the per-request httpx client
+        await ctx.api.aclose()
 
     return JSONResponse(_ok(rpc_id, result))
 

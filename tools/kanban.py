@@ -1,22 +1,19 @@
 """
-Kanban MCP tools — direct MongoDB access via Motor.
+Kanban MCP tools — calls the Next.js REST API.
 
 Tools:
-  kanban_get_column_order  → retrieve column order for a board
-  kanban_set_column_order  → upsert column order for a board
-
-Identifier format (mirrors getKanbanColumnOrderKey in utils.ts):
-  {userId}_{projectId}_{groupType}
+  kanban_get_column_order  → GET  /api/kanban/column-order?projectId=&groupType=
+  kanban_set_column_order  → POST /api/kanban/column-order
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
-from db.connection import COLL_KANBAN, get_db
+from api.client import TMSApiError
 from tools._utils import mcp_error, mcp_ok
+from tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -63,19 +60,10 @@ KANBAN_SET_COLUMN_ORDER_SCHEMA: dict[str, Any] = {
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _kanban_key(user_id: str, project_id: str, group_type: str) -> str:
-    """Mirror getKanbanColumnOrderKey() from utils.ts."""
-    return f"{user_id}_{project_id}_{group_type}"
-
-
-# ---------------------------------------------------------------------------
 # Tool handlers
 # ---------------------------------------------------------------------------
 
-async def kanban_get_column_order(args: dict, user_id: str) -> dict:
+async def kanban_get_column_order(args: dict, ctx: ToolContext) -> dict:
     """Retrieve the persisted column order for a kanban board."""
     project_id: str | None = args.get("projectId")
     group_type: str | None = args.get("groupType")
@@ -86,33 +74,21 @@ async def kanban_get_column_order(args: dict, user_id: str) -> dict:
         return mcp_error("Error getting kanban column order: groupType must be 'status' or 'priority'")
 
     try:
-        db = get_db()
-        coll = db[COLL_KANBAN]
-
-        identifier = _kanban_key(user_id, project_id, group_type)
-        doc = await coll.find_one({"identifier": identifier})
-
-        if not doc:
-            return mcp_ok({
-                "projectId": project_id,
-                "groupType": group_type,
-                "columns": [],
-                "message": "No column order saved yet for this board",
-            })
-
-        return mcp_ok({
-            "projectId": project_id,
-            "groupType": group_type,
-            "columns": doc.get("entityOrder", []),
-            "identifier": identifier,
-        })
+        data = await ctx.api.get(
+            "/api/kanban/column-order",
+            params={"projectId": project_id, "groupType": group_type},
+        )
+        return mcp_ok(data)
+    except TMSApiError as exc:
+        logger.error("kanban_get_column_order failed: %s", exc)
+        return mcp_error(f"Error getting kanban column order: {exc}")
     except Exception as exc:
-        logger.exception("kanban_get_column_order failed")
+        logger.exception("kanban_get_column_order unexpected error")
         return mcp_error(f"Error getting kanban column order: {exc}")
 
 
-async def kanban_set_column_order(args: dict, user_id: str) -> dict:
-    """Persist the column order for a kanban board (upsert)."""
+async def kanban_set_column_order(args: dict, ctx: ToolContext) -> dict:
+    """Persist the column order for a kanban board."""
     project_id: str | None = args.get("projectId")
     group_type: str | None = args.get("groupType")
     columns: list | None = args.get("columns")
@@ -124,34 +100,20 @@ async def kanban_set_column_order(args: dict, user_id: str) -> dict:
     if not columns or not isinstance(columns, list) or len(columns) == 0:
         return mcp_error("Error setting kanban column order: columns must be a non-empty array")
 
+    body: dict[str, Any] = {
+        "projectId": project_id,
+        "groupType": group_type,
+        "columns": columns,
+    }
+    if args.get("projectIdentifier"):
+        body["projectIdentifier"] = args["projectIdentifier"]
+
     try:
-        db = get_db()
-        coll = db[COLL_KANBAN]
-
-        identifier = _kanban_key(user_id, project_id, group_type)
-        now = datetime.now(tz=timezone.utc)
-
-        await coll.update_one(
-            {"identifier": identifier},
-            {
-                "$set": {
-                    "entityOrder": columns,
-                    "updatedAt": now,
-                },
-                "$setOnInsert": {
-                    "createdAt": now,
-                },
-            },
-            upsert=True,
-        )
-
-        return mcp_ok({
-            "projectId": project_id,
-            "groupType": group_type,
-            "columns": columns,
-            "identifier": identifier,
-            "message": "Column order updated successfully",
-        })
+        data = await ctx.api.post("/api/kanban/column-order", json=body)
+        return mcp_ok(data)
+    except TMSApiError as exc:
+        logger.error("kanban_set_column_order failed: %s", exc)
+        return mcp_error(f"Error setting kanban column order: {exc}")
     except Exception as exc:
-        logger.exception("kanban_set_column_order failed")
+        logger.exception("kanban_set_column_order unexpected error")
         return mcp_error(f"Error setting kanban column order: {exc}")
